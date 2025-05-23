@@ -42,8 +42,8 @@ else:
     st.error("OpenAI API key not found. Please set it in your .env file")
     st.stop()
 
-# Initialize OpenAI client with API key
-client = openai.OpenAI(api_key=OPENAI_API_KEY)
+# Set OpenAI API key
+openai.api_key = OPENAI_API_KEY
 
 # Constants
 HISTORY_FILE = "search_history.json"
@@ -247,10 +247,9 @@ def get_transcript(video_url):
         try:
             # Use OpenAI's Whisper API for transcription
             with open(temp_file, "rb") as audio_file:
-                transcript = client.audio.transcriptions.create(
+                transcript = openai.Audio.transcribe(
                     model="whisper-1",
                     file=audio_file,
-                    language="en"  # Set language to English
                 )
             
             transcript_text = transcript.text
@@ -297,11 +296,11 @@ def summarize_transcript(transcript_text):
                 "Focus only on the most important points.\n\nContent:\n" + chunk
             )
             try:
-                response = client.chat.completions.create(
+                response = openai.ChatCompletion.create(
                     model="gpt-3.5-turbo",
                     messages=[
-                        {"role": "system", "content": "You are a concise summarizer. Provide brief, focused summaries in English."},
-                        {"role": "user", "content": prompt}
+                        {"role": "system", "content": "You are a helpful assistant that summarizes YouTube videos."},
+                        {"role": "user", "content": f"Please summarize this transcript: {transcript_text}"}
                     ],
                     max_tokens=MAX_TOKENS_CHUNK,
                     temperature=TEMPERATURE
@@ -329,15 +328,15 @@ def summarize_transcript(transcript_text):
                     status_text.text(f"✨ Creating final summary... {percentage}%")
                     
                     prompt = (
-                        "Create a concise summary of the following content. "
+                        "Create a detailed summary of the following content. "
                         "Focus on the main points.\n\nContent:\n" + part
                     )
                     try:
-                        response = client.chat.completions.create(
+                        response = openai.ChatCompletion.create(
                             model="gpt-3.5-turbo",
                             messages=[
-                                {"role": "system", "content": "You are a concise summarizer. Provide brief, focused summaries in English."},
-                                {"role": "user", "content": prompt}
+                                {"role": "system", "content": "You are a helpful assistant that summarizes YouTube videos."},
+                                {"role": "user", "content": f"Please create a detailed summary of this transcript: {part}"}
                             ],
                             max_tokens=MAX_TOKENS_FINAL,
                             temperature=TEMPERATURE
@@ -353,11 +352,11 @@ def summarize_transcript(transcript_text):
                     "Focus on the main points.\n\nContent:\n" + combined_summary
                 )
                 try:
-                    response = client.chat.completions.create(
+                    response = openai.ChatCompletion.create(
                         model="gpt-3.5-turbo",
                         messages=[
-                            {"role": "system", "content": "You are a concise summarizer. Provide brief, focused summaries in English."},
-                            {"role": "user", "content": prompt}
+                            {"role": "system", "content": "You are a helpful assistant that summarizes YouTube videos."},
+                            {"role": "user", "content": f"Please create a concise summary of this transcript: {transcript_text}"}
                         ],
                         max_tokens=MAX_TOKENS_FINAL,
                         temperature=TEMPERATURE
