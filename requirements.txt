@@ -1,6 +1,10 @@
+<<<<<<< HEAD
 # Requires-Python >=3.12,<3.13
 pip==23.3.1
 streamlit==1.23.1
+=======
+streamlit==1.32.0
+>>>>>>> 42fcf209d19065f5fff8818cb9edd144bd3806c7
 openai==1.12.0
 pytube==15.0.0
 youtube-transcript-api==0.6.2
@@ -9,4 +13,4 @@ requests==2.28.2
 python-dotenv==0.21.0
 httpx>=0.24.1
 urllib3==1.26.15
-pillow==9.5.0 
+pillow==10.0.0
