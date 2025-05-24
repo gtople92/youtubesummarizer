@@ -250,6 +250,50 @@ def get_transcript_with_timestamps(video_url, progress_bar=None, status_text=Non
             
             return transcript
             
+        except NoTranscriptFound as e:
+            if status_text: status_text.text("No transcript found. Checking video description and comments...")
+            
+            # Try to get video metadata
+            try:
+                yt = YouTube(video_url)
+                
+                # Check if video has captions
+                if not yt.captions:
+                    st.warning("""
+                        ⚠️ This video doesn't have any captions/subtitles available.
+                        We'll try to use the video description and comments as a fallback.
+                    """)
+                
+                # Get video description
+                description = yt.description if yt.description else ""
+                
+                # Try to get comments (limited to first 100)
+                comments = []
+                try:
+                    for comment in yt.comments[:100]:
+                        comments.append(comment.text)
+                except Exception as comment_error:
+                    st.warning("Could not fetch comments. Proceeding with available information.")
+                
+                # Combine description and comments
+                combined_text = description
+                if comments:
+                    combined_text += "\n\nComments:\n" + "\n".join(comments)
+                
+                if combined_text.strip():
+                    if status_text: status_text.text("Using video description and comments as fallback...")
+                    # Create a transcript-like structure
+                    return [{
+                        "text": combined_text,
+                        "start": 0,
+                        "duration": 0
+                    }]
+                else:
+                    raise NoTranscriptFound("No transcript, description, or comments available")
+                    
+            except Exception as e:
+                st.warning("Could not get video metadata. Proceeding with audio transcription...")
+            
         except Exception as e:
             if "Could not find a transcript" in str(e) or "no element found" in str(e):
                 if status_text: status_text.text("No transcript found or YouTube returned an empty response. Attempting to transcribe audio...")
@@ -257,15 +301,6 @@ def get_transcript_with_timestamps(video_url, progress_bar=None, status_text=Non
                 if status_text: status_text.text(f"Error getting transcript: {str(e)}")
                 st.error(f"Error getting transcript: {str(e)}")
                 return None
-            
-        # If no transcript found, try to get it from the video description
-        try:
-            yt = YouTube(video_url)
-            if yt.description:
-                if status_text: status_text.text("Found video description. Using it as a fallback...")
-                return [{"text": yt.description, "start": 0, "duration": 0}]
-        except Exception as e:
-            st.warning("Could not get video description. Proceeding with audio transcription...")
             
         # If all else fails, download and transcribe the audio
         try:
