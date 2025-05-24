@@ -125,10 +125,10 @@ def validate_youtube_url(url):
     """Validate if the URL is a valid YouTube URL"""
     if not url:
         return False, "Please enter a YouTube URL"
-        
-    # Remove any whitespace
     url = url.strip()
-    
+    # Remove any timestamp or extra parameters
+    if '&' in url:
+        url = url.split('&')[0]
     # Common YouTube URL patterns
     patterns = [
         r'(https?://)?(www\.)?youtube\.com/watch\?v=([^&=%\?]{11})',  # Standard watch URL
@@ -137,13 +137,10 @@ def validate_youtube_url(url):
         r'(https?://)?(www\.)?youtu\.be/([^&=%\?]{11})',             # Short URL
         r'(https?://)?(www\.)?youtube\.com/shorts/([^&=%\?]{11})'     # Shorts URL
     ]
-    
-    # Try each pattern
     for pattern in patterns:
         match = re.match(pattern, url)
         if match:
             video_id = match.group(3)
-            # Verify if the video exists by making a HEAD request
             try:
                 response = requests.head(f"https://www.youtube.com/watch?v={video_id}", allow_redirects=True)
                 if response.status_code == 200:
@@ -153,9 +150,7 @@ def validate_youtube_url(url):
                 else:
                     return False, f"Video URL returned status code {response.status_code}. Please check if the video is available."
             except requests.RequestException:
-                # If HEAD request fails, still return the video ID and let pytube handle the validation
                 return True, video_id
-    
     return False, "Please enter a valid YouTube URL (e.g., https://www.youtube.com/watch?v=...)"
 
 def download_video_with_retry(url, max_retries=3, delay=2):
@@ -169,8 +164,20 @@ def download_video_with_retry(url, max_retries=3, delay=2):
     for attempt in range(max_retries):
         try:
             yt = YouTube(url)
-            # Get the audio stream
-            audio_stream = yt.streams.filter(only_audio=True).first()
+            
+            # Get video info first to check if it's available
+            try:
+                video_length = yt.length
+                if video_length > 3600:  # If video is longer than 1 hour
+                    st.warning(f"This is a long video ({video_length//3600} hours {video_length%3600//60} minutes). Processing may take some time...")
+                    # For very long videos, we'll use the lowest quality audio
+                    audio_stream = yt.streams.filter(only_audio=True).order_by('abr').first()
+                else:
+                    audio_stream = yt.streams.filter(only_audio=True).first()
+            except Exception as e:
+                st.warning("Could not get video length. Proceeding with download...")
+                audio_stream = yt.streams.filter(only_audio=True).order_by('abr').first()
+            
             if not audio_stream:
                 raise Exception("No audio stream found for this video")
             
@@ -178,9 +185,16 @@ def download_video_with_retry(url, max_retries=3, delay=2):
             temp_file = tempfile.NamedTemporaryFile(delete=False, suffix='.mp4')
             temp_file.close()
             
-            # Download the audio
-            audio_stream.download(filename=temp_file.name)
+            # Download the audio with progress tracking
+            with st.spinner(f"Downloading video audio (Attempt {attempt + 1}/{max_retries})..."):
+                audio_stream.download(filename=temp_file.name)
+                
+            # Verify the file was downloaded and has content
+            if os.path.getsize(temp_file.name) == 0:
+                raise Exception("Downloaded file is empty")
+                
             return temp_file.name
+            
         except HTTPError as e:
             if e.code == 403:
                 if attempt < max_retries - 1:
@@ -200,14 +214,18 @@ def download_video_with_retry(url, max_retries=3, delay=2):
                 raise ValueError("This video requires age verification and cannot be processed.")
             elif "Video is private" in str(e):
                 raise ValueError("This video is private and cannot be accessed.")
+            elif "File too large" in str(e):
+                raise ValueError("This video is too large to process. Please try a shorter video.")
             elif attempt < max_retries - 1:
                 st.warning(f"Download attempt {attempt + 1} failed. Retrying in {delay} seconds...")
                 time.sleep(delay)
                 continue
             else:
                 raise Exception(f"Failed to download video: {str(e)}")
+                
+    raise Exception("Failed to download video after all retry attempts")
 
-def get_transcript(video_url):
+def get_transcript(video_url, progress_bar=None, status_text=None):
     try:
         # Validate URL
         is_valid, result = validate_youtube_url(video_url)
@@ -219,22 +237,51 @@ def get_transcript(video_url):
         
         # First try to get the transcript using YouTube Transcript API
         try:
-            # Try to get English transcript
+            # Try to get Hindi transcript first, then English
             try:
-                transcript = YouTubeTranscriptApi.get_transcript(video_id, languages=['en'])
-                transcript_text = " ".join([entry["text"] for entry in transcript])
-                return transcript_text
+                transcript = YouTubeTranscriptApi.get_transcript(video_id, languages=['hi'])
+                if status_text: status_text.text("Found Hindi transcript!")
             except NoTranscriptFound:
-                st.info("No transcript found. Attempting to transcribe audio...")
-            except Exception as e:
-                if "Could not find a transcript" in str(e):
-                    st.info("No transcript found. Attempting to transcribe audio...")
-                else:
-                    raise e
-        except Exception as e:
-            st.info("No transcript found. Attempting to transcribe audio...")
+                try:
+                    transcript = YouTubeTranscriptApi.get_transcript(video_id, languages=['en'])
+                    if status_text: status_text.text("Found English transcript!")
+                except NoTranscriptFound:
+                    raise NoTranscriptFound("No Hindi or English transcript found")
             
-        # Download the video with retry logic
+            # Process transcript in chunks to avoid memory issues
+            chunk_size = 100  # Process 100 transcript entries at a time
+            transcript_parts = []
+            num_chunks = (len(transcript) + chunk_size - 1) // chunk_size
+            for i in range(0, len(transcript), chunk_size):
+                chunk = transcript[i:i + chunk_size]
+                chunk_text = " ".join([entry["text"] for entry in chunk])
+                transcript_parts.append(chunk_text)
+                if num_chunks > 1 and progress_bar and status_text:
+                    progress = 5 + int(45 * (i + len(chunk)) / len(transcript))
+                    progress_bar.progress(progress)
+                    status_text.text(f"Processing transcript chunk {i//chunk_size+1} of {num_chunks}... ({progress}%)")
+            
+            return " ".join(transcript_parts)
+            
+        except Exception as e:
+            # Handle empty or malformed transcript responses gracefully
+            if "Could not find a transcript" in str(e) or "no element found" in str(e):
+                if status_text: status_text.text("No transcript found or YouTube returned an empty response. Attempting to transcribe audio...")
+            else:
+                if status_text: status_text.text(f"Error getting transcript: {str(e)}")
+                st.error(f"Error getting transcript: {str(e)}")
+                return None
+            
+        # If no transcript found, try to get it from the video description
+        try:
+            yt = YouTube(video_url)
+            if yt.description:
+                if status_text: status_text.text("Found video description. Using it as a fallback...")
+                return yt.description
+        except Exception as e:
+            st.warning("Could not get video description. Proceeding with audio transcription...")
+            
+        # If all else fails, download and transcribe the audio
         try:
             temp_file = download_video_with_retry(video_url)
         except ValueError as e:
@@ -245,19 +292,74 @@ def get_transcript(video_url):
             return None
         
         try:
-            # Use OpenAI's Whisper API for transcription
-            with open(temp_file, "rb") as audio_file:
-                transcript = openai.Audio.transcribe(
-                    model="whisper-1",
-                    file=audio_file,
-                )
+            # For very long videos, process in chunks
+            file_size = os.path.getsize(temp_file)
+            chunk_size = 5 * 1024 * 1024  # 5MB
+            total_chunks = (file_size + chunk_size - 1) // chunk_size
+            if total_chunks > 1:
+                if status_text: status_text.text(f"Processing video in {total_chunks} chunks...")
             
-            transcript_text = transcript.text
+            # Add language selection
+            language = st.radio(
+                "Select audio language for transcription:",
+                ["Hindi", "English"],
+                horizontal=True
+            )
             
-            # Clean up the temporary file
-            os.unlink(temp_file)
+            # Map language selection to Whisper language code
+            language_code = "hi" if language == "Hindi" else "en"
             
-            return transcript_text
+            transcript_parts = []
+            for chunk_num in range(total_chunks):
+                with st.spinner(f"Processing chunk {chunk_num + 1} of {total_chunks}..."):
+                    with open(temp_file, "rb") as audio_file:
+                        # Seek to the start of the chunk
+                        audio_file.seek(chunk_num * chunk_size)
+                        # Read the chunk
+                        chunk_data = audio_file.read(chunk_size)
+                        
+                        # Create a temporary file for the chunk
+                        chunk_file = tempfile.NamedTemporaryFile(delete=False, suffix='.mp4')
+                        chunk_file.write(chunk_data)
+                        chunk_file.close()
+                        
+                        try:
+                            # Transcribe the chunk with retry logic
+                            max_retries = 3
+                            for retry in range(max_retries):
+                                try:
+                                    with open(chunk_file.name, "rb") as chunk_audio:
+                                        chunk_transcript = openai.Audio.transcribe(
+                                            model="whisper-1",
+                                            file=chunk_audio,
+                                            language=language_code
+                                        )
+                                    transcript_parts.append(chunk_transcript.text)
+                                    break
+                                except Exception as e:
+                                    if retry < max_retries - 1:
+                                        st.warning(f"Retrying chunk {chunk_num + 1} (attempt {retry + 2}/{max_retries})...")
+                                        time.sleep(2)  # Wait before retry
+                                    else:
+                                        raise e
+                            
+                        except Exception as e:
+                            st.warning(f"Error processing chunk {chunk_num + 1}: {str(e)}")
+                            continue
+                        finally:
+                            # Clean up the chunk file
+                            if os.path.exists(chunk_file.name):
+                                os.unlink(chunk_file.name)
+            
+            # Clean up the main temporary file
+            if os.path.exists(temp_file):
+                os.unlink(temp_file)
+            
+            if not transcript_parts:
+                raise Exception("No transcript parts were successfully processed")
+            
+            return " ".join(transcript_parts)
+            
         except Exception as e:
             # Clean up the temporary file in case of error
             if os.path.exists(temp_file):
@@ -266,118 +368,107 @@ def get_transcript(video_url):
             return None
             
     except Exception as e:
+        if status_text: status_text.text(f"An error occurred: {str(e)}")
         st.error(f"An error occurred: {str(e)}")
         return None
 
-def summarize_transcript(transcript_text):
+def summarize_transcript(transcript_text, progress_bar=None, status_text=None):
     if not transcript_text:
         return None
-        
-    # Split transcript into smaller chunks
-    words = transcript_text.split()
-    chunks = [words[i:i + CHUNK_SIZE] for i in range(0, len(words), CHUNK_SIZE)]
-    chunk_texts = [" ".join(chunk) for chunk in chunks]
+    max_chunk_size = 1000
+    chunks = []
+    current_chunk = []
+    current_size = 0
+    sentences = transcript_text.split('. ')
+    for sentence in sentences:
+        if not sentence.endswith('.'): sentence += '.'
+        sentence_tokens = len(sentence) // 1.5
+        if sentence_tokens > max_chunk_size:
+            for i in range(0, len(sentence), int(max_chunk_size * 1.5)):
+                part = sentence[i:i+int(max_chunk_size*1.5)]
+                if len(part) > 0:
+                    chunks.append(part)
+            continue
+        if current_size + sentence_tokens > max_chunk_size:
+            if current_chunk:
+                chunks.append(' '.join(current_chunk))
+            current_chunk = [sentence]
+            current_size = sentence_tokens
+        else:
+            current_chunk.append(sentence)
+            current_size += sentence_tokens
+    if current_chunk:
+        chunks.append(' '.join(current_chunk))
+    num_chunks = len(chunks)  # Ensure num_chunks is always defined
     summaries = []
-    
-    # Show initial progress
-    progress_bar = st.progress(0)
-    status_text = st.empty()
-    
     try:
-        for i, chunk in enumerate(chunk_texts):
-            # Update progress
-            progress = (i + 1) / len(chunk_texts)
-            percentage = int(progress * 100)
-            progress_bar.progress(progress)
-            status_text.text(f"🎥 Processing video content... {percentage}%")
-            
-            prompt = (
-                "Provide a very concise summary (2-3 sentences) of the following content. "
-                "Focus only on the most important points.\n\nContent:\n" + chunk
-            )
+        for i, chunk in enumerate(chunks):
+            if num_chunks > 1 and progress_bar and status_text:
+                progress = 60 + int(40 * (i + 1) / num_chunks)
+                progress_bar.progress(progress)
+                status_text.text(f"Summarizing chunk {i+1} of {num_chunks}... ({progress}%)")
             try:
+                system_message = "Summarize."
+                user_message = chunk
                 response = openai.ChatCompletion.create(
                     model="gpt-3.5-turbo",
                     messages=[
-                        {"role": "system", "content": "You are a helpful assistant that summarizes YouTube videos."},
-                        {"role": "user", "content": f"Please summarize this transcript: {transcript_text}"}
+                        {"role": "system", "content": system_message},
+                        {"role": "user", "content": user_message}
                     ],
-                    max_tokens=MAX_TOKENS_CHUNK,
+                    max_tokens=100,
                     temperature=TEMPERATURE
                 )
                 summary = response.choices[0].message.content.strip()
                 summaries.append(summary)
             except Exception as e:
-                raise Exception(f"An error occurred while processing the video: {e}")
-                
-        # Combine summaries into a final summary
+                st.warning(f"Error processing chunk {i + 1}: {str(e)}")
+                continue
         if summaries:
-            status_text.text("✨ Creating final summary...")
             combined_summary = " ".join(summaries)
-            
-            # If combined summary is too long, summarize it in parts
-            if len(combined_summary.split()) > 1000:
-                # Split into smaller parts
-                summary_parts = [combined_summary[i:i+2000] for i in range(0, len(combined_summary), 2000)]
+            if len(combined_summary) > max_chunk_size:
+                summary_parts = [combined_summary[i:i+max_chunk_size] for i in range(0, len(combined_summary), max_chunk_size)]
                 final_summaries = []
-                
                 for i, part in enumerate(summary_parts):
-                    progress = (i + 1) / len(summary_parts)
-                    percentage = int(progress * 100)
-                    progress_bar.progress(progress)
-                    status_text.text(f"✨ Creating final summary... {percentage}%")
-                    
-                    prompt = (
-                        "Create a detailed summary of the following content. "
-                        "Focus on the main points.\n\nContent:\n" + part
-                    )
                     try:
+                        system_message = "Summarize."
+                        user_message = part
                         response = openai.ChatCompletion.create(
                             model="gpt-3.5-turbo",
                             messages=[
-                                {"role": "system", "content": "You are a helpful assistant that summarizes YouTube videos."},
-                                {"role": "user", "content": f"Please create a detailed summary of this transcript: {part}"}
+                                {"role": "system", "content": system_message},
+                                {"role": "user", "content": user_message}
                             ],
-                            max_tokens=MAX_TOKENS_FINAL,
+                            max_tokens=150,
                             temperature=TEMPERATURE
                         )
                         final_summaries.append(response.choices[0].message.content.strip())
                     except Exception as e:
-                        raise Exception(f"An error occurred while creating the summary: {e}")
-                
+                        st.warning(f"Error creating final summary part {i + 1}: {str(e)}")
+                        continue
                 final_summary = " ".join(final_summaries)
             else:
-                prompt = (
-                    "Create a concise summary of the following content. "
-                    "Focus on the main points.\n\nContent:\n" + combined_summary
-                )
                 try:
+                    system_message = "Summarize."
+                    user_message = combined_summary
                     response = openai.ChatCompletion.create(
                         model="gpt-3.5-turbo",
                         messages=[
-                            {"role": "system", "content": "You are a helpful assistant that summarizes YouTube videos."},
-                            {"role": "user", "content": f"Please create a concise summary of this transcript: {transcript_text}"}
+                            {"role": "system", "content": system_message},
+                            {"role": "user", "content": user_message}
                         ],
-                        max_tokens=MAX_TOKENS_FINAL,
+                        max_tokens=150,
                         temperature=TEMPERATURE
                     )
                     final_summary = response.choices[0].message.content.strip()
                 except Exception as e:
-                    raise Exception(f"An error occurred while creating the summary: {e}")
-            
+                    raise Exception(f"An error occurred while creating the final summary: {e}")
             return final_summary
         return None
-        
     except Exception as e:
-        # Clean up progress indicators
-        progress_bar.empty()
-        status_text.empty()
+        if status_text: status_text.text(str(e))
         st.error(str(e))
         return None
-    finally:
-        # Ensure progress indicators are cleared
-        progress_bar.empty()
-        status_text.empty()
 
 def text_to_speech(text):
     """Convert text to speech and return audio data"""
@@ -471,15 +562,19 @@ with col2:
     )
 
     if video_url:
-        with st.spinner("🎬 Starting video analysis..."):
-            # Get transcript
-            transcript = get_transcript(video_url)
-            
+        progress_bar = st.progress(0)
+        status_text = st.empty()
+        try:
+            status_text.text("Fetching transcript...")
+            progress_bar.progress(5)
+            transcript = get_transcript(video_url, progress_bar, status_text)
             if transcript:
-                # Summarize transcript
-                summary = summarize_transcript(transcript)
-                
+                status_text.text("Summarizing transcript...")
+                progress_bar.progress(60)
+                summary = summarize_transcript(transcript, progress_bar, status_text)
                 if summary:
+                    status_text.text("Summary ready!")
+                    progress_bar.progress(100)
                     st.success("✨ Summary ready!")
                     st.markdown("""
                         <div style='background-color: #f0f2f6; padding: 1.5rem; border-radius: 5px; margin-top: 1rem;'>
@@ -487,18 +582,13 @@ with col2:
                             <p style='line-height: 1.6;'>{}</p>
                         </div>
                     """.format(summary), unsafe_allow_html=True)
-                    
-                    # Add text-to-speech button
                     if st.button("🔊 Read Summary", help="Click to hear the summary read aloud"):
                         with st.spinner("Generating audio..."):
                             st.session_state.audio_data = text_to_speech(summary)
                             if st.session_state.audio_data:
                                 autoplay_audio(st.session_state.audio_data)
-                    
-                    # Add download buttons
                     col1, col2 = st.columns(2)
                     with col1:
-                        # Download text summary
                         summary_bytes = summary.encode('utf-8')
                         st.download_button(
                             label="📥 Download Summary",
@@ -508,7 +598,6 @@ with col2:
                             help="Click to download the summary as a text file"
                         )
                     with col2:
-                        # Download audio summary
                         if st.session_state.audio_data:
                             st.download_button(
                                 label="📥 Download Audio",
@@ -517,13 +606,18 @@ with col2:
                                 mime="audio/mp3",
                                 help="Click to download the audio version of the summary"
                             )
-                    
-                    # Save to history
                     save_to_history(video_url, summary)
                 else:
+                    status_text.text("Failed to generate summary.")
+                    progress_bar.progress(0)
                     st.error("❌ Failed to generate summary.")
             else:
+                status_text.text("Could not process the video. Please check if the video is available and try again.")
+                progress_bar.progress(0)
                 st.error("❌ Could not process the video. Please check if the video is available and try again.")
+        finally:
+            progress_bar.empty()
+            status_text.empty()
 
 # Display search history
 display_history()
