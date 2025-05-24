@@ -7,7 +7,7 @@ st.set_page_config(
     layout="wide"
 )
 
-import openai
+import groq
 import time
 from pytube import YouTube
 import os
@@ -22,7 +22,7 @@ from datetime import datetime
 from gtts import gTTS
 import base64
 from config import (
-    OPENAI_API_KEY,
+    GROQ_API_KEY,
     MAX_HISTORY_ITEMS,
     CHUNK_SIZE,
     MAX_TOKENS_CHUNK,
@@ -31,19 +31,16 @@ from config import (
 )
 
 # Debug: Check API key format
-if OPENAI_API_KEY:
-    if not OPENAI_API_KEY.startswith('sk-'):
-        st.error("Invalid API key format. API key should start with 'sk-'")
-        st.stop()
-    if len(OPENAI_API_KEY) < 20:  # Basic length check
+if GROQ_API_KEY:
+    if len(GROQ_API_KEY) < 20:  # Basic length check
         st.error("Invalid API key format. API key appears to be too short")
         st.stop()
 else:
-    st.error("OpenAI API key not found. Please set it in your .env file")
+    st.error("Groq API key not found. Please set it in your .env file")
     st.stop()
 
-# Set OpenAI API key
-openai.api_key = OPENAI_API_KEY
+# Initialize Groq client
+client = groq.Groq(api_key=GROQ_API_KEY)
 
 # Constants
 HISTORY_FILE = "search_history.json"
@@ -439,8 +436,8 @@ def get_transcript_with_timestamps(video_url, progress_bar=None, status_text=Non
                             for retry in range(max_retries):
                                 try:
                                     with open(chunk_file.name, "rb") as chunk_audio:
-                                        chunk_transcript = openai.Audio.transcribe(
-                                            model="whisper-1",
+                                        chunk_transcript = groq.Audio.transcribe(
+                                            model="whisper-large-v3",  # Using Whisper model for audio transcription
                                             file=chunk_audio,
                                             language=language_code
                                         )
@@ -506,23 +503,27 @@ def wait_for_rate_limit(e):
         # Default wait time if we can't parse the error
         return 1
 
-def call_openai_with_retry(messages, max_retries=5, initial_delay=1):
-    """Call OpenAI API with retry logic and exponential backoff"""
+def call_groq_with_retry(messages, max_retries=5, initial_delay=1):
+    """Call Groq API with retry logic and exponential backoff"""
     for attempt in range(max_retries):
         try:
-            response = openai.ChatCompletion.create(
-                model="gpt-3.5-turbo",
+            response = client.chat.completions.create(
+                model="llama3-70b-8192",
                 messages=messages,
-                max_tokens=100,
+                max_tokens=50,  # Reduced max tokens
                 temperature=TEMPERATURE
             )
             return response.choices[0].message.content.strip()
         except Exception as e:
-            if "Rate limit" in str(e):
+            if "Rate limit" in str(e) or "tokens" in str(e):
                 wait_time = wait_for_rate_limit(e)
                 if attempt < max_retries - 1:
                     time.sleep(wait_time)
                     continue
+            elif "model_not_found" in str(e):
+                st.error(f"Model not found. Please check your Groq API access and available models.")
+                st.error(f"Error details: {str(e)}")
+                raise e
             raise e
     return None
 
@@ -541,10 +542,14 @@ def summarize_transcript_by_intervals(transcript, interval_minutes=5, progress_b
     for segment in transcript:
         if segment["start"] >= current_interval_start + interval_seconds:
             if current_interval:
+                # Limit the text length to avoid token limits
+                interval_text = " ".join([s["text"] for s in current_interval])
+                if len(interval_text) > 1000:  # Limit text length
+                    interval_text = interval_text[:1000] + "..."
                 intervals.append({
                     "start": current_interval_start,
                     "end": current_interval_start + interval_seconds,
-                    "text": " ".join([s["text"] for s in current_interval])
+                    "text": interval_text
                 })
             current_interval = [segment]
             current_interval_start = segment["start"]
@@ -553,10 +558,13 @@ def summarize_transcript_by_intervals(transcript, interval_minutes=5, progress_b
     
     # Add the last interval if it exists
     if current_interval:
+        interval_text = " ".join([s["text"] for s in current_interval])
+        if len(interval_text) > 1000:  # Limit text length
+            interval_text = interval_text[:1000] + "..."
         intervals.append({
             "start": current_interval_start,
             "end": current_interval_start + interval_seconds,
-            "text": " ".join([s["text"] for s in current_interval])
+            "text": interval_text
         })
     
     # Generate summaries for each interval
@@ -568,20 +576,42 @@ def summarize_transcript_by_intervals(transcript, interval_minutes=5, progress_b
             status_text.text(f"Summarizing interval {i+1} of {len(intervals)}... ({progress}%)")
         
         try:
-            system_message = "Summarize this segment of the video concisely."
-            user_message = interval["text"]
+            # Split text into smaller chunks if needed
+            text_chunks = []
+            current_chunk = ""
+            words = interval["text"].split()
             
-            # Use the retry logic for API calls
-            summary = call_openai_with_retry([
-                {"role": "system", "content": system_message},
-                {"role": "user", "content": user_message}
-            ])
+            for word in words:
+                if len(current_chunk) + len(word) + 1 <= 500:  # Limit chunk size
+                    current_chunk += " " + word if current_chunk else word
+                else:
+                    text_chunks.append(current_chunk)
+                    current_chunk = word
             
-            if summary:
+            if current_chunk:
+                text_chunks.append(current_chunk)
+            
+            # Summarize each chunk
+            chunk_summaries = []
+            for chunk in text_chunks:
+                system_message = "Summarize this segment of the video concisely in 2-3 sentences."
+                user_message = chunk
+                
+                summary = call_groq_with_retry([
+                    {"role": "system", "content": system_message},
+                    {"role": "user", "content": user_message}
+                ])
+                
+                if summary:
+                    chunk_summaries.append(summary)
+            
+            # Combine chunk summaries
+            if chunk_summaries:
+                final_summary = " ".join(chunk_summaries)
                 interval_summaries.append({
                     "start": format_timestamp(interval["start"]),
                     "end": format_timestamp(interval["end"]),
-                    "summary": summary
+                    "summary": final_summary
                 })
             else:
                 st.warning(f"Could not generate summary for interval {i+1}. Skipping...")
@@ -872,7 +902,7 @@ display_history()
 
 # Footer
 st.markdown("""
-    <div class="app-footer">
-        <p>Powered by OpenAI GPT-3.5 and Whisper API</p>
+    <div style='text-align: center; margin-top: 3rem; color: #666;'>
+        <p>Powered by Groq Mixtral-8x7b and Whisper API</p>
     </div>
     """, unsafe_allow_html=True) 

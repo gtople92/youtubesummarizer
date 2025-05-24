@@ -16,13 +16,13 @@ else:
     print(f"❌ .env file not found at: {env_path}")
 
 # API Keys
-OPENAI_API_KEY = os.getenv('OPENAI_API_KEY')
+GROQ_API_KEY = os.getenv('GROQ_API_KEY')
 
 # Debug: Print API key status
-if OPENAI_API_KEY:
+if GROQ_API_KEY:
     print("✅ API key loaded successfully")
-    print(f"API key starts with: {OPENAI_API_KEY[:7]}...")
-    print(f"API key length: {len(OPENAI_API_KEY)}")
+    print(f"API key starts with: {GROQ_API_KEY[:7]}...")
+    print(f"API key length: {len(GROQ_API_KEY)}")
 else:
     print("❌ API key not found in environment variables")
 
