@@ -225,6 +225,35 @@ def download_video_with_retry(url, max_retries=3, delay=2):
                 
     raise Exception("Failed to download video after all retry attempts")
 
+def get_video_metadata(video_url):
+    """Get video metadata including description and comments"""
+    try:
+        yt = YouTube(video_url)
+        metadata = {
+            'title': yt.title,
+            'description': yt.description,
+            'length': yt.length,
+            'author': yt.author,
+            'views': yt.views,
+            'comments': []
+        }
+        
+        # Try to get comments
+        try:
+            for comment in yt.comments[:50]:  # Limit to 50 comments for performance
+                metadata['comments'].append({
+                    'text': comment.text,
+                    'author': comment.author,
+                    'likes': comment.likes
+                })
+        except Exception as e:
+            st.warning("Could not fetch comments. Proceeding with available information.")
+        
+        return metadata
+    except Exception as e:
+        st.error(f"Error getting video metadata: {str(e)}")
+        return None
+
 def get_transcript_with_timestamps(video_url, progress_bar=None, status_text=None):
     try:
         # Validate URL
@@ -234,6 +263,18 @@ def get_transcript_with_timestamps(video_url, progress_bar=None, status_text=Non
             return None
             
         video_id = result  # The validated video ID
+        
+        # Get video metadata first
+        if status_text: status_text.text("Getting video information...")
+        metadata = get_video_metadata(video_url)
+        
+        if metadata:
+            st.markdown(f"""
+                <div style='background-color: #f0f2f6; padding: 1rem; border-radius: 5px; margin-bottom: 1rem;'>
+                    <h3 style='color: #FF0000; margin-bottom: 0.5rem;'>{metadata['title']}</h3>
+                    <p style='color: #666;'>By {metadata['author']} • {metadata['views']:,} views</p>
+                </div>
+            """, unsafe_allow_html=True)
         
         # First try to get the transcript using YouTube Transcript API
         try:
@@ -251,52 +292,39 @@ def get_transcript_with_timestamps(video_url, progress_bar=None, status_text=Non
             return transcript
             
         except NoTranscriptFound as e:
-            if status_text: status_text.text("No transcript found. Checking video description and comments...")
+            if status_text: status_text.text("No transcript found. Using alternative content...")
             
-            # Try to get video metadata
-            try:
-                yt = YouTube(video_url)
+            # Create content from metadata
+            content_parts = []
+            
+            if metadata:
+                # Add description
+                if metadata['description']:
+                    content_parts.append(f"Video Description:\n{metadata['description']}")
                 
-                # Check if video has captions
-                if not yt.captions:
-                    st.warning("""
-                        ⚠️ This video doesn't have any captions/subtitles available.
-                        We'll try to use the video description and comments as a fallback.
-                    """)
-                
-                # Get video description
-                description = yt.description if yt.description else ""
-                
-                # Try to get comments (limited to first 100)
-                comments = []
-                try:
-                    for comment in yt.comments[:100]:
-                        comments.append(comment.text)
-                except Exception as comment_error:
-                    st.warning("Could not fetch comments. Proceeding with available information.")
-                
-                # Combine description and comments
-                combined_text = description
-                if comments:
-                    combined_text += "\n\nComments:\n" + "\n".join(comments)
-                
-                if combined_text.strip():
-                    if status_text: status_text.text("Using video description and comments as fallback...")
-                    # Create a transcript-like structure
-                    return [{
-                        "text": combined_text,
-                        "start": 0,
-                        "duration": 0
-                    }]
-                else:
-                    raise NoTranscriptFound("No transcript, description, or comments available")
-                    
-            except Exception as e:
-                st.warning("Could not get video metadata. Proceeding with audio transcription...")
+                # Add comments
+                if metadata['comments']:
+                    content_parts.append("\nTop Comments:")
+                    for comment in metadata['comments']:
+                        content_parts.append(f"- {comment['text']}")
+            
+            if content_parts:
+                if status_text: status_text.text("Using video description and comments as content...")
+                # Create a transcript-like structure
+                return [{
+                    "text": "\n\n".join(content_parts),
+                    "start": 0,
+                    "duration": 0
+                }]
+            else:
+                st.warning("""
+                    ⚠️ No subtitles available for this video.
+                    We'll need to transcribe the audio, which may take longer and be less accurate.
+                """)
             
         except Exception as e:
             if "Could not find a transcript" in str(e) or "no element found" in str(e):
-                if status_text: status_text.text("No transcript found or YouTube returned an empty response. Attempting to transcribe audio...")
+                if status_text: status_text.text("No transcript found. Proceeding with audio transcription...")
             else:
                 if status_text: status_text.text(f"Error getting transcript: {str(e)}")
                 st.error(f"Error getting transcript: {str(e)}")
