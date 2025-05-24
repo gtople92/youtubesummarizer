@@ -225,7 +225,7 @@ def download_video_with_retry(url, max_retries=3, delay=2):
                 
     raise Exception("Failed to download video after all retry attempts")
 
-def get_transcript(video_url, progress_bar=None, status_text=None):
+def get_transcript_with_timestamps(video_url, progress_bar=None, status_text=None):
     try:
         # Validate URL
         is_valid, result = validate_youtube_url(video_url)
@@ -248,23 +248,9 @@ def get_transcript(video_url, progress_bar=None, status_text=None):
                 except NoTranscriptFound:
                     raise NoTranscriptFound("No Hindi or English transcript found")
             
-            # Process transcript in chunks to avoid memory issues
-            chunk_size = 100  # Process 100 transcript entries at a time
-            transcript_parts = []
-            num_chunks = (len(transcript) + chunk_size - 1) // chunk_size
-            for i in range(0, len(transcript), chunk_size):
-                chunk = transcript[i:i + chunk_size]
-                chunk_text = " ".join([entry["text"] for entry in chunk])
-                transcript_parts.append(chunk_text)
-                if num_chunks > 1 and progress_bar and status_text:
-                    progress = 5 + int(45 * (i + len(chunk)) / len(transcript))
-                    progress_bar.progress(progress)
-                    status_text.text(f"Processing transcript chunk {i//chunk_size+1} of {num_chunks}... ({progress}%)")
-            
-            return " ".join(transcript_parts)
+            return transcript
             
         except Exception as e:
-            # Handle empty or malformed transcript responses gracefully
             if "Could not find a transcript" in str(e) or "no element found" in str(e):
                 if status_text: status_text.text("No transcript found or YouTube returned an empty response. Attempting to transcribe audio...")
             else:
@@ -277,7 +263,7 @@ def get_transcript(video_url, progress_bar=None, status_text=None):
             yt = YouTube(video_url)
             if yt.description:
                 if status_text: status_text.text("Found video description. Using it as a fallback...")
-                return yt.description
+                return [{"text": yt.description, "start": 0, "duration": 0}]
         except Exception as e:
             st.warning("Could not get video description. Proceeding with audio transcription...")
             
@@ -310,6 +296,7 @@ def get_transcript(video_url, progress_bar=None, status_text=None):
             language_code = "hi" if language == "Hindi" else "en"
             
             transcript_parts = []
+            current_time = 0
             for chunk_num in range(total_chunks):
                 with st.spinner(f"Processing chunk {chunk_num + 1} of {total_chunks}..."):
                     with open(temp_file, "rb") as audio_file:
@@ -334,7 +321,13 @@ def get_transcript(video_url, progress_bar=None, status_text=None):
                                             file=chunk_audio,
                                             language=language_code
                                         )
-                                    transcript_parts.append(chunk_transcript.text)
+                                    # Add timestamp to the transcript
+                                    transcript_parts.append({
+                                        "text": chunk_transcript.text,
+                                        "start": current_time,
+                                        "duration": 30  # Approximate duration for each chunk
+                                    })
+                                    current_time += 30
                                     break
                                 except Exception as e:
                                     if retry < max_retries - 1:
@@ -358,7 +351,7 @@ def get_transcript(video_url, progress_bar=None, status_text=None):
             if not transcript_parts:
                 raise Exception("No transcript parts were successfully processed")
             
-            return " ".join(transcript_parts)
+            return transcript_parts
             
         except Exception as e:
             # Clean up the temporary file in case of error
@@ -372,103 +365,117 @@ def get_transcript(video_url, progress_bar=None, status_text=None):
         st.error(f"An error occurred: {str(e)}")
         return None
 
-def summarize_transcript(transcript_text, progress_bar=None, status_text=None):
-    if not transcript_text:
-        return None
-    max_chunk_size = 1000
-    chunks = []
-    current_chunk = []
-    current_size = 0
-    sentences = transcript_text.split('. ')
-    for sentence in sentences:
-        if not sentence.endswith('.'): sentence += '.'
-        sentence_tokens = len(sentence) // 1.5
-        if sentence_tokens > max_chunk_size:
-            for i in range(0, len(sentence), int(max_chunk_size * 1.5)):
-                part = sentence[i:i+int(max_chunk_size*1.5)]
-                if len(part) > 0:
-                    chunks.append(part)
-            continue
-        if current_size + sentence_tokens > max_chunk_size:
-            if current_chunk:
-                chunks.append(' '.join(current_chunk))
-            current_chunk = [sentence]
-            current_size = sentence_tokens
-        else:
-            current_chunk.append(sentence)
-            current_size += sentence_tokens
-    if current_chunk:
-        chunks.append(' '.join(current_chunk))
-    num_chunks = len(chunks)  # Ensure num_chunks is always defined
-    summaries = []
+def format_timestamp(seconds):
+    """Convert seconds to HH:MM:SS format"""
+    hours = int(seconds // 3600)
+    minutes = int((seconds % 3600) // 60)
+    seconds = int(seconds % 60)
+    return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+
+def wait_for_rate_limit(e):
+    """Extract wait time from rate limit error and return it"""
     try:
-        for i, chunk in enumerate(chunks):
-            if num_chunks > 1 and progress_bar and status_text:
-                progress = 60 + int(40 * (i + 1) / num_chunks)
-                progress_bar.progress(progress)
-                status_text.text(f"Summarizing chunk {i+1} of {num_chunks}... ({progress}%)")
-            try:
-                system_message = "Summarize."
-                user_message = chunk
-                response = openai.ChatCompletion.create(
-                    model="gpt-3.5-turbo",
-                    messages=[
-                        {"role": "system", "content": system_message},
-                        {"role": "user", "content": user_message}
-                    ],
-                    max_tokens=100,
-                    temperature=TEMPERATURE
-                )
-                summary = response.choices[0].message.content.strip()
-                summaries.append(summary)
-            except Exception as e:
-                st.warning(f"Error processing chunk {i + 1}: {str(e)}")
-                continue
-        if summaries:
-            combined_summary = " ".join(summaries)
-            if len(combined_summary) > max_chunk_size:
-                summary_parts = [combined_summary[i:i+max_chunk_size] for i in range(0, len(combined_summary), max_chunk_size)]
-                final_summaries = []
-                for i, part in enumerate(summary_parts):
-                    try:
-                        system_message = "Summarize."
-                        user_message = part
-                        response = openai.ChatCompletion.create(
-                            model="gpt-3.5-turbo",
-                            messages=[
-                                {"role": "system", "content": system_message},
-                                {"role": "user", "content": user_message}
-                            ],
-                            max_tokens=150,
-                            temperature=TEMPERATURE
-                        )
-                        final_summaries.append(response.choices[0].message.content.strip())
-                    except Exception as e:
-                        st.warning(f"Error creating final summary part {i + 1}: {str(e)}")
-                        continue
-                final_summary = " ".join(final_summaries)
+        # Extract wait time from error message
+        wait_time = int(re.search(r'Please try again in (\d+)ms', str(e)).group(1))
+        # Convert to seconds and add a small buffer
+        return (wait_time / 1000) + 0.1
+    except:
+        # Default wait time if we can't parse the error
+        return 1
+
+def call_openai_with_retry(messages, max_retries=5, initial_delay=1):
+    """Call OpenAI API with retry logic and exponential backoff"""
+    for attempt in range(max_retries):
+        try:
+            response = openai.ChatCompletion.create(
+                model="gpt-3.5-turbo",
+                messages=messages,
+                max_tokens=100,
+                temperature=TEMPERATURE
+            )
+            return response.choices[0].message.content.strip()
+        except Exception as e:
+            if "Rate limit" in str(e):
+                wait_time = wait_for_rate_limit(e)
+                if attempt < max_retries - 1:
+                    time.sleep(wait_time)
+                    continue
+            raise e
+    return None
+
+def summarize_transcript_by_intervals(transcript, interval_minutes=5, progress_bar=None, status_text=None):
+    if not transcript:
+        return None
+    
+    # Convert interval from minutes to seconds
+    interval_seconds = interval_minutes * 60
+    
+    # Group transcript segments by time intervals
+    intervals = []
+    current_interval = []
+    current_interval_start = 0
+    
+    for segment in transcript:
+        if segment["start"] >= current_interval_start + interval_seconds:
+            if current_interval:
+                intervals.append({
+                    "start": current_interval_start,
+                    "end": current_interval_start + interval_seconds,
+                    "text": " ".join([s["text"] for s in current_interval])
+                })
+            current_interval = [segment]
+            current_interval_start = segment["start"]
+        else:
+            current_interval.append(segment)
+    
+    # Add the last interval if it exists
+    if current_interval:
+        intervals.append({
+            "start": current_interval_start,
+            "end": current_interval_start + interval_seconds,
+            "text": " ".join([s["text"] for s in current_interval])
+        })
+    
+    # Generate summaries for each interval
+    interval_summaries = []
+    for i, interval in enumerate(intervals):
+        if progress_bar and status_text:
+            progress = 60 + int(40 * (i + 1) / len(intervals))
+            progress_bar.progress(progress)
+            status_text.text(f"Summarizing interval {i+1} of {len(intervals)}... ({progress}%)")
+        
+        try:
+            system_message = "Summarize this segment of the video concisely."
+            user_message = interval["text"]
+            
+            # Use the retry logic for API calls
+            summary = call_openai_with_retry([
+                {"role": "system", "content": system_message},
+                {"role": "user", "content": user_message}
+            ])
+            
+            if summary:
+                interval_summaries.append({
+                    "start": format_timestamp(interval["start"]),
+                    "end": format_timestamp(interval["end"]),
+                    "summary": summary
+                })
             else:
-                try:
-                    system_message = "Summarize."
-                    user_message = combined_summary
-                    response = openai.ChatCompletion.create(
-                        model="gpt-3.5-turbo",
-                        messages=[
-                            {"role": "system", "content": system_message},
-                            {"role": "user", "content": user_message}
-                        ],
-                        max_tokens=150,
-                        temperature=TEMPERATURE
-                    )
-                    final_summary = response.choices[0].message.content.strip()
-                except Exception as e:
-                    raise Exception(f"An error occurred while creating the final summary: {e}")
-            return final_summary
-        return None
-    except Exception as e:
-        if status_text: status_text.text(str(e))
-        st.error(str(e))
-        return None
+                st.warning(f"Could not generate summary for interval {i+1}. Skipping...")
+                continue
+                
+        except Exception as e:
+            if "Rate limit" in str(e):
+                st.warning(f"Rate limit reached. Waiting before retrying...")
+                time.sleep(wait_for_rate_limit(e))
+                # Retry this interval
+                i -= 1
+                continue
+            else:
+                st.warning(f"Error summarizing interval {i+1}: {str(e)}")
+                continue
+    
+    return interval_summaries
 
 def text_to_speech(text):
     """Convert text to speech and return audio data"""
@@ -506,9 +513,21 @@ def autoplay_audio(audio_data):
 # Custom CSS
 st.markdown("""
     <style>
+    /* Reset and base styles */
+    * {
+        margin: 0;
+        padding: 0;
+        box-sizing: border-box;
+    }
+    
     .main {
         padding: 2rem;
+        max-width: 1200px;
+        margin: 0 auto;
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
     }
+    
+    /* Button styles */
     .stButton>button {
         width: 100%;
         background-color: #FF0000;
@@ -517,37 +536,101 @@ st.markdown("""
         padding: 0.5rem 1rem;
         border-radius: 5px;
         font-weight: bold;
+        -webkit-transition: background-color 0.3s ease;
+        -moz-transition: background-color 0.3s ease;
+        -o-transition: background-color 0.3s ease;
+        transition: background-color 0.3s ease;
+        cursor: pointer;
     }
+    
     .stButton>button:hover {
         background-color: #CC0000;
     }
+    
+    /* Input styles */
     .stTextInput>div>div>input {
         border-radius: 5px;
+        border: 1px solid #ccc;
+        padding: 0.5rem;
+        width: 100%;
+        -webkit-appearance: none;
+        -moz-appearance: none;
+        appearance: none;
     }
-    .stSuccess {
+    
+    /* Message styles */
+    .stSuccess, .stError {
         padding: 1rem;
         border-radius: 5px;
+        margin: 1rem 0;
+    }
+    
+    .stSuccess {
         background-color: #f0f2f6;
     }
-    .stError {
-        padding: 1rem;
+    
+    /* Summary container */
+    .summary-container {
+        background-color: #f0f2f6;
+        padding: 1.5rem;
         border-radius: 5px;
+        margin-top: 1rem;
+        -webkit-box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        -moz-box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+    }
+    
+    /* Header styles */
+    .app-header {
+        text-align: center;
+        color: #FF0000;
+        margin-bottom: 2rem;
+        font-size: 2.5rem;
+        font-weight: bold;
+    }
+    
+    /* Description styles */
+    .app-description {
+        text-align: center;
+        margin-bottom: 2rem;
+        color: #333;
+        line-height: 1.6;
+    }
+    
+    /* Footer styles */
+    .app-footer {
+        text-align: center;
+        margin-top: 3rem;
+        color: #666;
+        padding: 1rem 0;
+        border-top: 1px solid #eee;
+    }
+    
+    /* Responsive layout */
+    @media screen and (max-width: 768px) {
+        .main {
+            padding: 1rem;
+        }
+        
+        .app-header {
+            font-size: 2rem;
+        }
     }
     </style>
     """, unsafe_allow_html=True)
 
 # Header
 st.markdown("""
-    <h1 style='text-align: center; color: #FF0000; margin-bottom: 2rem;'>
+    <div class="app-header">
         YouTube Video Summarizer
-    </h1>
+    </div>
     """, unsafe_allow_html=True)
 
 # Description
 st.markdown("""
-    <p style='text-align: center; margin-bottom: 2rem;'>
+    <div class="app-description">
         Enter a YouTube video URL below to get an AI-generated summary of its content.
-    </p>
+    </div>
     """, unsafe_allow_html=True)
 
 # Create two columns for better layout
@@ -567,29 +650,60 @@ with col2:
         try:
             status_text.text("Fetching transcript...")
             progress_bar.progress(5)
-            transcript = get_transcript(video_url, progress_bar, status_text)
+            
+            # Add interval selection
+            interval_minutes = st.slider(
+                "Select time interval for summaries (minutes):",
+                min_value=1,
+                max_value=30,
+                value=5,
+                step=1
+            )
+            
+            transcript = get_transcript_with_timestamps(video_url, progress_bar, status_text)
             if transcript:
-                status_text.text("Summarizing transcript...")
+                status_text.text("Generating interval summaries...")
                 progress_bar.progress(60)
-                summary = summarize_transcript(transcript, progress_bar, status_text)
-                if summary:
+                interval_summaries = summarize_transcript_by_intervals(
+                    transcript, 
+                    interval_minutes, 
+                    progress_bar, 
+                    status_text
+                )
+                
+                if interval_summaries:
                     status_text.text("Summary ready!")
                     progress_bar.progress(100)
                     st.success("✨ Summary ready!")
+                    
+                    # Display interval summaries
                     st.markdown("""
-                        <div style='background-color: #f0f2f6; padding: 1.5rem; border-radius: 5px; margin-top: 1rem;'>
-                            <h3 style='color: #FF0000; margin-bottom: 1rem;'>Video Summary</h3>
-                            <p style='line-height: 1.6;'>{}</p>
-                        </div>
-                    """.format(summary), unsafe_allow_html=True)
-                    if st.button("🔊 Read Summary", help="Click to hear the summary read aloud"):
-                        with st.spinner("Generating audio..."):
-                            st.session_state.audio_data = text_to_speech(summary)
-                            if st.session_state.audio_data:
-                                autoplay_audio(st.session_state.audio_data)
+                        <div class="summary-container">
+                            <h3 style='color: #FF0000; margin-bottom: 1rem;'>Video Summary by Time Intervals</h3>
+                    """, unsafe_allow_html=True)
+                    
+                    for interval in interval_summaries:
+                        st.markdown(f"""
+                            <div style='margin-bottom: 1.5rem; padding: 1rem; background-color: white; border-radius: 5px;'>
+                                <h4 style='color: #666; margin-bottom: 0.5rem;'>
+                                    {interval['start']} - {interval['end']}
+                                </h4>
+                                <p style='line-height: 1.6;'>{interval['summary']}</p>
+                            </div>
+                        """, unsafe_allow_html=True)
+                    
+                    st.markdown("</div>", unsafe_allow_html=True)
+                    
+                    # Add download options
                     col1, col2 = st.columns(2)
                     with col1:
-                        summary_bytes = summary.encode('utf-8')
+                        # Create formatted text for download
+                        summary_text = "Video Summary by Time Intervals\n\n"
+                        for interval in interval_summaries:
+                            summary_text += f"[{interval['start']} - {interval['end']}]\n"
+                            summary_text += f"{interval['summary']}\n\n"
+                        
+                        summary_bytes = summary_text.encode('utf-8')
                         st.download_button(
                             label="📥 Download Summary",
                             data=summary_bytes,
@@ -597,16 +711,27 @@ with col2:
                             mime="text/plain",
                             help="Click to download the summary as a text file"
                         )
+                    
                     with col2:
-                        if st.session_state.audio_data:
-                            st.download_button(
-                                label="📥 Download Audio",
-                                data=st.session_state.audio_data,
-                                file_name="video_summary.mp3",
-                                mime="audio/mp3",
-                                help="Click to download the audio version of the summary"
-                            )
-                    save_to_history(video_url, summary)
+                        if st.button("🔊 Read Summary", help="Click to hear the summary read aloud"):
+                            with st.spinner("Generating audio..."):
+                                # Combine all summaries for audio
+                                full_summary = "\n\n".join([
+                                    f"From {interval['start']} to {interval['end']}: {interval['summary']}"
+                                    for interval in interval_summaries
+                                ])
+                                st.session_state.audio_data = text_to_speech(full_summary)
+                                if st.session_state.audio_data:
+                                    autoplay_audio(st.session_state.audio_data)
+                                    st.download_button(
+                                        label="📥 Download Audio",
+                                        data=st.session_state.audio_data,
+                                        file_name="video_summary.mp3",
+                                        mime="audio/mp3",
+                                        help="Click to download the audio version of the summary"
+                                    )
+                    
+                    save_to_history(video_url, summary_text)
                 else:
                     status_text.text("Failed to generate summary.")
                     progress_bar.progress(0)
@@ -624,7 +749,7 @@ display_history()
 
 # Footer
 st.markdown("""
-    <div style='text-align: center; margin-top: 3rem; color: #666;'>
+    <div class="app-footer">
         <p>Powered by OpenAI GPT-3.5 and Whisper API</p>
     </div>
     """, unsafe_allow_html=True) 
