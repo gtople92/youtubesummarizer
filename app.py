@@ -228,30 +228,75 @@ def download_video_with_retry(url, max_retries=3, delay=2):
 def get_video_metadata(video_url):
     """Get video metadata including description and comments"""
     try:
-        yt = YouTube(video_url)
-        metadata = {
-            'title': yt.title,
-            'description': yt.description,
-            'length': yt.length,
-            'author': yt.author,
-            'views': yt.views,
-            'comments': []
-        }
+        # Add retry logic for YouTube API calls
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                yt = YouTube(video_url)
+                
+                # Basic metadata that's usually available
+                metadata = {
+                    'title': None,
+                    'description': None,
+                    'length': None,
+                    'author': None,
+                    'views': None,
+                    'comments': []
+                }
+                
+                # Try to get basic metadata first
+                try:
+                    metadata['title'] = yt.title
+                except:
+                    pass
+                    
+                try:
+                    metadata['author'] = yt.author
+                except:
+                    pass
+                    
+                try:
+                    metadata['views'] = yt.views
+                except:
+                    pass
+                    
+                try:
+                    metadata['length'] = yt.length
+                except:
+                    pass
+                    
+                try:
+                    metadata['description'] = yt.description
+                except:
+                    pass
+                
+                # Only try to get comments if we have basic metadata
+                if any(metadata.values()):
+                    try:
+                        for comment in yt.comments[:20]:  # Reduced to 20 comments for better performance
+                            metadata['comments'].append({
+                                'text': comment.text,
+                                'author': comment.author,
+                                'likes': comment.likes
+                            })
+                    except Exception as comment_error:
+                        st.warning("Could not fetch comments. Proceeding with available information.")
+                
+                # Return metadata if we have at least some information
+                if any(metadata.values()):
+                    return metadata
+                    
+            except Exception as e:
+                if attempt < max_retries - 1:
+                    time.sleep(1)  # Wait before retry
+                    continue
+                else:
+                    raise e
+                    
+        return None
         
-        # Try to get comments
-        try:
-            for comment in yt.comments[:50]:  # Limit to 50 comments for performance
-                metadata['comments'].append({
-                    'text': comment.text,
-                    'author': comment.author,
-                    'likes': comment.likes
-                })
-        except Exception as e:
-            st.warning("Could not fetch comments. Proceeding with available information.")
-        
-        return metadata
     except Exception as e:
-        st.error(f"Error getting video metadata: {str(e)}")
+        st.warning(f"Could not get complete video metadata: {str(e)}")
         return None
 
 def get_transcript_with_timestamps(video_url, progress_bar=None, status_text=None):
@@ -269,12 +314,27 @@ def get_transcript_with_timestamps(video_url, progress_bar=None, status_text=Non
         metadata = get_video_metadata(video_url)
         
         if metadata:
-            st.markdown(f"""
-                <div style='background-color: #f0f2f6; padding: 1rem; border-radius: 5px; margin-bottom: 1rem;'>
-                    <h3 style='color: #FF0000; margin-bottom: 0.5rem;'>{metadata['title']}</h3>
-                    <p style='color: #666;'>By {metadata['author']} • {metadata['views']:,} views</p>
-                </div>
-            """, unsafe_allow_html=True)
+            # Create a more resilient display that only shows available information
+            metadata_display = []
+            
+            if metadata['title']:
+                metadata_display.append(f"<h3 style='color: #FF0000; margin-bottom: 0.5rem;'>{metadata['title']}</h3>")
+            
+            author_views = []
+            if metadata['author']:
+                author_views.append(metadata['author'])
+            if metadata['views']:
+                author_views.append(f"{metadata['views']:,} views")
+            
+            if author_views:
+                metadata_display.append(f"<p style='color: #666;'>By {' • '.join(author_views)}</p>")
+            
+            if metadata_display:
+                st.markdown(f"""
+                    <div style='background-color: #f0f2f6; padding: 1rem; border-radius: 5px; margin-bottom: 1rem;'>
+                        {''.join(metadata_display)}
+                    </div>
+                """, unsafe_allow_html=True)
         
         # First try to get the transcript using YouTube Transcript API
         try:
